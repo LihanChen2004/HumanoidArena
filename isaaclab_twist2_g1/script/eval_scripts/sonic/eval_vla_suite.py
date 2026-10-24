@@ -223,6 +223,8 @@ def _run_episode(
         args.sonic_encoder_path,
         "--sonic_decoder_path",
         args.sonic_decoder_path,
+        "--gmt_backend",
+        args.gmt_backend,
         "--sonic_vla_root_rot6d_layout",
         args.sonic_vla_root_rot6d_layout,
         "--sonic_vla_root_max_delta_deg",
@@ -364,6 +366,8 @@ def _run_episode_batch(
         args.sonic_encoder_path,
         "--sonic_decoder_path",
         args.sonic_decoder_path,
+        "--gmt_backend",
+        args.gmt_backend,
         "--sonic_vla_root_rot6d_layout",
         args.sonic_vla_root_rot6d_layout,
         "--sonic_vla_root_max_delta_deg",
@@ -647,6 +651,13 @@ def main() -> int:
     parser.add_argument("--robot_type", type=str, default="unitree_g1_refpose_v3_1")
     parser.add_argument("--sonic_encoder_path", type=str, required=True)
     parser.add_argument("--sonic_decoder_path", type=str, required=True)
+    parser.add_argument(
+        "--gmt_backend",
+        type=str,
+        default="sonic",
+        choices=["sonic", "sonic_low_latency"],
+        help="SONIC GMT backend variant: sonic (default 1762-dim) or sonic_low_latency (1247-dim).",
+    )
     parser.add_argument(
         "--sonic_vla_root_rot6d_layout",
         type=str,

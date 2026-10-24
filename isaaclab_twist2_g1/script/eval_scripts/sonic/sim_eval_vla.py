@@ -80,6 +80,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sonic_effort_control", action="store_true", default=False)
     parser.add_argument("--sonic_debug", action="store_true", default=False)
     parser.add_argument("--sonic_log_every", type=int, default=50)
+    parser.add_argument(
+        "--gmt_backend",
+        type=str,
+        default="sonic",
+        choices=["sonic", "sonic_low_latency"],
+        help="SONIC GMT backend variant: sonic (default 1762-dim encoder) or sonic_low_latency (1247-dim encoder).",
+    )
     parser.add_argument("--lerobot_server_url", type=str, required=True)
     parser.add_argument("--lerobot_server_timeout", type=float, default=5.0)
     parser.add_argument("--lerobot_server_verify_ssl", action="store_true", default=False)
@@ -166,7 +173,9 @@ def _ensure_unique_multi_image_shm_name(args) -> str:
 
 def _normalize_control_routing(args):
     args.input_source = "vla"
-    args.gmt_backend = "sonic"
+    # Preserve the requested SONIC variant (sonic | sonic_low_latency).
+    if not getattr(args, "gmt_backend", None) or args.gmt_backend not in {"sonic", "sonic_low_latency"}:
+        args.gmt_backend = "sonic"
     args.action_source = "sonic_wholebody"
     args.enable_wholebody_dds = True
     args.enable_dex1_dds = False

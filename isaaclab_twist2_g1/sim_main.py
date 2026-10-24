@@ -47,20 +47,20 @@ parser.add_argument(
 )
 parser.add_argument("--action_source", type=str, default="dds",
                    choices=["dds", "file", "trajectory", "policy", "replay",
-                            "twist2_wholebody", "sonic_wholebody", "openpi"],
+                            "twist2_wholebody", "sonic_wholebody", "mimic_lite_wholebody"],
                    help="Action source")
 parser.add_argument(
     "--input_source",
     type=str,
     default="",
-    choices=["", "pico_twist2", "pico_sonic", "vla", "replay"],
+    choices=["", "pico_twist2", "pico_sonic", "pico_mimic_lite", "vla", "replay"],
     help="Optional high-level input source alias",
 )
 parser.add_argument(
     "--gmt_backend",
     type=str,
     default="",
-    choices=["", "twist2", "sonic", "sonic_joint29"],
+    choices=["", "twist2", "sonic", "sonic_joint29", "sonic_low_latency", "mimic_lite"],
     help="Optional GMT backend alias",
 )
 parser.add_argument(
@@ -107,12 +107,12 @@ parser.add_argument("--sonic_encoder_path", type=str, default="",
                     help="Path to GEAR-SONIC encoder ONNX model")
 parser.add_argument("--sonic_decoder_path", type=str, default="",
                     help="Path to GEAR-SONIC decoder ONNX model")
+parser.add_argument("--sonic_input_timeout_s", type=float, default=0.25,
+                    help="Seconds without a fresh SONIC pose frame before holding the default standing pose; 0 disables the guard")
 
-# OpenPI-specific arguments (legacy provider only)
-parser.add_argument("--openpi_checkpoint", type=str, default="",
-                    help="Path to OpenPI checkpoint directory")
+# VLA-specific arguments
 parser.add_argument("--language_instruction", type=str, default="",
-                    help="Language instruction for OpenPI/VLA")
+                    help="Language instruction for VLA")
 parser.add_argument("--lerobot_policy_path", type=str, default="",
                     help="Path to a LeRobot pretrained_model directory")
 parser.add_argument("--lerobot_policy_device", type=str, default="",
@@ -131,14 +131,25 @@ parser.add_argument("--smplx_model_path", type=str,
 parser.add_argument("--human_height", type=float, default=1.75,
                     help="Human height in meters for GMR scaling")
 parser.add_argument("--twist2_model_path", type=str, default="",
-                    help="TWIST2 policy used downstream of VLA/OpenPI. Defaults to --model_path when empty.")
-parser.add_argument("--video_save_dir", type=str, default="./videos/openpi",
-                    help="Directory to save VLA/OpenPI videos")
+                    help="TWIST2 policy used downstream of VLA. Defaults to --model_path when empty.")
+parser.add_argument("--video_save_dir", type=str, default="./videos/vla",
+                    help="Directory to save VLA videos")
 parser.add_argument("--video_fps", type=int, default=30,
-                    help="Video frame rate for VLA/OpenPI recording")
+                    help="Video frame rate for VLA recording")
 parser.add_argument("--enable_smpl_vis", action="store_true", default=True,
-                    help="Enable SMPL visualization for VLA/OpenPI video recording")
+                    help="Enable SMPL visualization for VLA video recording")
 
+
+
+# MimicLite-specific arguments
+parser.add_argument("--mimic_lite_onnx_path", type=str, default="",
+                    help="Path to exported MimicLite ONNX policy")
+parser.add_argument("--mimic_lite_yaml_path", type=str, default="",
+                    help="Path to exported MimicLite deploy YAML")
+parser.add_argument("--mimic_lite_redis_host", type=str, default="localhost",
+                    help="Redis host for MimicLite GMR reference input")
+parser.add_argument("--mimic_lite_redis_port", type=int, default=6379,
+                    help="Redis port for MimicLite GMR reference input")
 
 parser.add_argument("--robot_type", type=str, default="unitree_g1_rotlocal_v3", help="robot type")
 parser.add_argument("--enable_dex1_dds", action="store_true", help="enable gripper DDS")
@@ -222,6 +233,18 @@ parser.add_argument(
     default=10,
     help="max queued save jobs before producer blocks",
 )
+parser.add_argument(
+    "--max_steps",
+    type=int,
+    default=0,
+    help="stop after this many main-loop control steps; 0 keeps the legacy infinite loop",
+)
+parser.add_argument(
+    "--eval_video_path",
+    type=str,
+    default="",
+    help="optional mp4 path for a short eval recording from front_camera rgb frames",
+)
 
 # random seed for reproducibility
 parser.add_argument("--seed", type=int, default=None, help="random seed for reproducibility (default: None)")
@@ -257,6 +280,13 @@ parser.add_argument(
 )
 parser.add_argument("--left_wrist_camera_port", type=int, default=5557, help="ZMQ port for left wrist camera streaming")
 parser.add_argument("--right_wrist_camera_port", type=int, default=5558, help="ZMQ port for right wrist camera streaming")
+parser.add_argument(
+    "--viewport_camera",
+    type=str,
+    default="world",
+    choices=["world", "front", "auto"],
+    help="GUI viewport camera preference: world third-person, front robot camera, or auto.",
+)
 
 # add AppLauncher parameters
 AppLauncher.add_app_launcher_args(parser)
@@ -297,6 +327,18 @@ from layeredcontrol.robot_control_system import (
 )
 
 from dds.reset_pose_dds import *
+
+# Bind MimicLite-aligned PD actuator config (G129_CFG_MIMIC_LITE) to gmt_backend=mimic_lite.
+# This must happen BEFORE `import tasks` because task env_cfg class attributes
+# (robot: ArticulationCfg = G1RobotPresets.g1_29dof_dex3_wholebody()) are evaluated at
+# module-import time, and get_base_config() reads MIMIC_LITE_ROBOT_CFG then.
+# Training-side PD from mimic-lite/assets/g1.py:
+#   stiffness = armature * (10*2*pi)^2, damping = 2*2*armature*(10*2*pi), friction=0.01
+# Other backends (twist2/sonic/sonic_low_latency) keep G129_CFG_WITH_DEX3_WHOLEBODY.
+if getattr(args_cli, "gmt_backend", "") == "mimic_lite" or getattr(args_cli, "action_source", "") == "mimic_lite_wholebody":
+    os.environ["MIMIC_LITE_ROBOT_CFG"] = "1"
+    print("[sim_main] gmt_backend=mimic_lite -> MIMIC_LITE_ROBOT_CFG=1 (BeyondMimic PD actuator config)")
+
 import tasks
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
@@ -326,18 +368,67 @@ from tools.get_reward import get_reward_debug_string
 from tools.joint_position_tracker import JointPositionTracker
 
 
+def _capture_front_camera_rgb(env):
+    try:
+        if "front_camera" not in env.scene.keys():
+            return None
+        camera = env.scene["front_camera"]
+        rgb = camera.data.output.get("rgb")
+        if rgb is None:
+            return None
+        frame = rgb[0].detach().cpu().numpy()
+        if frame.ndim != 3:
+            return None
+        if frame.shape[-1] == 4:
+            frame = frame[..., :3]
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        return frame
+    except Exception:
+        return None
+
+
+class _EvalVideoWriter:
+    def __init__(self, path: str, fps: int):
+        self.path = Path(path).expanduser()
+        self.fps = int(fps)
+        self.frames = []
+
+    def add(self, frame):
+        if frame is not None:
+            self.frames.append(frame.copy())
+
+    def close(self):
+        if not self.path or not self.frames:
+            return ""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            import imageio.v2 as imageio
+            imageio.mimsave(str(self.path), self.frames, fps=self.fps)
+            return str(self.path)
+        except Exception as exc:
+            print(f"[eval_video] failed to save {self.path}: {exc}")
+            return ""
+
+
 def _normalize_control_routing(args_cli):
     """Normalize input_source/gmt_backend aliases back to the legacy action_source."""
     if args_cli.input_source and args_cli.gmt_backend:
         route_map = {
             ("pico_twist2", "twist2"): "twist2_wholebody",
             ("pico_sonic", "sonic"): "sonic_wholebody",
+            ("pico_sonic", "sonic_low_latency"): "sonic_wholebody",
             ("pico_twist2", "sonic_joint29"): "sonic_wholebody",
+            ("pico_mimic_lite", "mimic_lite"): "mimic_lite_wholebody",
             ("vla", "twist2"): "twist2_wholebody",
             ("vla", "sonic"): "sonic_wholebody",
+            ("vla", "sonic_low_latency"): "sonic_wholebody",
+            ("vla", "mimic_lite"): "mimic_lite_wholebody",
             ("replay", "twist2"): "twist2_wholebody",
             ("replay", "sonic"): "sonic_wholebody",
+            ("replay", "sonic_low_latency"): "sonic_wholebody",
             ("replay", "sonic_joint29"): "sonic_wholebody",
+            ("replay", "mimic_lite"): "mimic_lite_wholebody",
         }
         mapped = route_map.get((args_cli.input_source, args_cli.gmt_backend))
         if mapped is None:
@@ -352,16 +443,19 @@ def _normalize_control_routing(args_cli):
     elif args_cli.action_source == "twist2_wholebody":
         args_cli.input_source = args_cli.input_source or "pico_twist2"
         args_cli.gmt_backend = args_cli.gmt_backend or "twist2"
-    elif args_cli.action_source == "openpi":
-        args_cli.gmt_backend = args_cli.gmt_backend or "twist2"
+    elif args_cli.action_source == "mimic_lite_wholebody":
+        args_cli.input_source = args_cli.input_source or "pico_mimic_lite"
+        args_cli.gmt_backend = args_cli.gmt_backend or "mimic_lite"
     elif args_cli.action_source == "replay":
         args_cli.input_source = args_cli.input_source or "replay"
         if args_cli.gmt_backend == "twist2":
             args_cli.action_source = "twist2_wholebody"
-        elif args_cli.gmt_backend == "sonic":
+        elif args_cli.gmt_backend in ("sonic", "sonic_low_latency"):
             args_cli.action_source = "sonic_wholebody"
         elif args_cli.gmt_backend == "sonic_joint29":
             args_cli.action_source = "sonic_wholebody"
+        elif args_cli.gmt_backend == "mimic_lite":
+            args_cli.action_source = "mimic_lite_wholebody"
 
 
 def _initialize_task_scene(env, env_cfg, args_cli):
@@ -505,9 +599,13 @@ def _resolve_input_guard_backend(args_cli):
     if getattr(args_cli, "gmt_backend", "") == "twist2" or getattr(args_cli, "action_source", "") == "twist2_wholebody":
         return "twist2"
     if getattr(args_cli, "gmt_backend", "") == "sonic" or getattr(args_cli, "action_source", "") == "sonic_wholebody":
+        if getattr(args_cli, "gmt_backend", "") == "sonic_low_latency":
+            return "sonic_low_latency"
         return "sonic"
     if getattr(args_cli, "gmt_backend", "") == "sonic_joint29":
         return "sonic_joint29"
+    if getattr(args_cli, "gmt_backend", "") == "mimic_lite":
+        return "mimic_lite"
     return None
 
 
@@ -831,7 +929,15 @@ def main():
     import os
     import atexit
     _normalize_control_routing(args_cli)
+    local_gmt_replay = bool(args_cli.replay_file) and args_cli.input_source == "replay" and args_cli.gmt_backend in {
+        "twist2",
+        "sonic",
+        "sonic_joint29",
+        "sonic_low_latency",
+        "mimic_lite",
+    }
     image_servers = None
+    dds_manager = None
     try:
         if args_cli.setpgrp:
             os.setpgrp()
@@ -858,20 +964,13 @@ def main():
         print(f"Input source: {args_cli.input_source or 'legacy'}")
         print(f"GMT backend: {args_cli.gmt_backend or 'legacy'}")
     if args_cli.input_source == "vla":
-        if args_cli.gmt_backend and args_cli.gmt_backend not in {"twist2", "sonic", "sonic_joint29"}:
+        if args_cli.gmt_backend and args_cli.gmt_backend not in {"twist2", "sonic", "sonic_joint29", "sonic_low_latency", "mimic_lite"}:
             raise ValueError("input_source=vla currently only supports --gmt_backend twist2, sonic, or sonic_joint29")
         if not args_cli.lerobot_server_url and not args_cli.lerobot_policy_path:
             raise ValueError("--lerobot_server_url or --lerobot_policy_path is required when using input_source=vla")
         if float(args_cli.human_height) <= 0.0:
             raise ValueError("--human_height must be positive when using input_source=vla")
-        print("VLA runtime schema: local_delta_isaac_time_v2, observation.state=64D, action=40D root-local delta output")
-    if args_cli.action_source == "openpi":
-        if not args_cli.openpi_checkpoint:
-            raise ValueError("--openpi_checkpoint is required when using action_source=openpi")
-        if not args_cli.language_instruction:
-            raise ValueError("--language_instruction is required when using action_source=openpi")
-        if not args_cli.twist2_model_path:
-            args_cli.twist2_model_path = args_cli.model_path
+        print("VLA runtime schema: unitree_g1_gmt_refpose_v3_1, observation.state=64D, action=40D ref-pose local output")
     print("=" * 60)
 
     # parse environment configuration
@@ -1014,11 +1113,18 @@ def main():
         if not camera_paths:
             print("  ⚠️ No cameras found in stage!")
 
-        # Try to find world camera first (third-person view), then fallback to front_cam
+        # Select the GUI viewport camera. This does not change image streaming cameras.
         world_cam_candidates = [p for p in camera_paths if "PerspectiveCamera" in p or "world_camera" in p.lower()]
         front_cam_candidates = [p for p in camera_paths if "front_cam" in p.lower()]
 
-        if world_cam_candidates:
+        viewport_camera = getattr(args_cli, "viewport_camera", "world")
+        if viewport_camera == "front" and front_cam_candidates:
+            cam_path = front_cam_candidates[0]
+            print(f"\n✅ Found front_cam at: {cam_path}")
+        elif viewport_camera == "front":
+            cam_path = "/World/envs/env_0/Robot/d435_link/front_cam"
+            print(f"\n⚠️ No front_cam found, trying expected path: {cam_path}")
+        elif world_cam_candidates:
             cam_path = world_cam_candidates[0]
             print(f"\n✅ Found world_camera at: {cam_path}")
         elif front_cam_candidates:
@@ -1042,6 +1148,8 @@ def main():
             new_cam = vp.get_active_camera()
             if new_cam == cam_path:
                 print(f"  ✅ Successfully switched viewport to: {cam_path}")
+                for _ in range(3):
+                    simulation_app.update()
             else:
                 print(f"  ❌ Failed to switch! Viewport still at: {new_cam}")
         else:
@@ -1055,7 +1163,7 @@ def main():
 
     # create simplified control configuration
     try:
-        wholebody_sources = {"twist2_wholebody", "sonic_wholebody", "openpi"}
+        wholebody_sources = {"twist2_wholebody", "sonic_wholebody", "mimic_lite_wholebody"}
         if args_cli.action_source == "sonic_wholebody":
             use_wholebody = True
             physics_dt = getattr(env, "physics_dt", None) or env_cfg.sim.dt
@@ -1098,7 +1206,10 @@ def main():
     
     # create controller
 
-    if not args_cli.replay_data:
+    if local_gmt_replay:
+        image_servers = []
+        print("[sim_main] Local GMT replay: skipping live image servers and DDS")
+    elif not args_cli.replay_data:
         print("========= create image server(s) =========")
         image_servers = []  # List to hold all image servers
 
@@ -1233,7 +1344,7 @@ def main():
 
 
     # set signal handlers
-    if not args_cli.replay_data:
+    if not args_cli.replay_data and not local_gmt_replay:
         setup_signal_handlers(controller, dds_manager, image_servers, simulation_app)
     else:
         setup_signal_handlers(controller, None, None, simulation_app)
@@ -1266,7 +1377,7 @@ def main():
         controller.start()
         print("========= start controller success =========")
         redis_reset_client = None
-        if not args_cli.replay_data:
+        if not args_cli.replay_data and not local_gmt_replay:
             try:
                 redis_reset_client = create_redis_client(
                     host=getattr(args_cli, "sonic_redis_host", "localhost"),
@@ -1286,6 +1397,16 @@ def main():
         loop_count = 0
         last_loop_time = time.time()
         recent_loop_times = []  # for calculating moving average frequency
+        camera_update_fn = None
+        if args_cli.enable_cameras and not local_gmt_replay:
+            try:
+                from tasks.common_observations.camera_state import get_camera_image
+
+                camera_update_fn = get_camera_image
+                print("[sim_main] Camera shared-memory refresh enabled in main loop")
+            except Exception as exc:
+                print(f"[sim_main] Camera shared-memory refresh unavailable: {exc}")
+        eval_video = _EvalVideoWriter(args_cli.eval_video_path, args_cli.video_fps) if args_cli.eval_video_path else None
 
         # use torch.inference_mode() and handle KeyboardInterrupt
         try:
@@ -1294,7 +1415,7 @@ def main():
                 while simulation_app.is_running() and controller.is_running:
                     current_time = time.time()
                     loop_count += 1
-                    if not args_cli.replay_data:
+                    if not args_cli.replay_data and not local_gmt_replay:
                         # Only update state and reward every 10 loops to improve performance
                         if loop_count % 10 == 0:
                             try:
@@ -1384,7 +1505,7 @@ def main():
                             except Exception as e:
                                 print(f"Failed to write reset pose command: {e}")
                                 raise e
-                    else:
+                    elif args_cli.replay_data:
                         if action_provider.get_start_loop() and data_idx < len(data_json_list):
                             print(f"data_idx: {data_idx}")
                             try:
@@ -1423,6 +1544,21 @@ def main():
                         controller.stop()
                         break
 
+                    if camera_update_fn is not None and loop_count % 3 == 0:
+                        try:
+                            camera_update_fn(env)
+                        except Exception as exc:
+                            if loop_count % 300 == 0:
+                                print(f"[sim_main] Camera shared-memory refresh failed: {exc}")
+
+                    if eval_video is not None:
+                        eval_video.add(_capture_front_camera_rgb(env))
+
+                    max_steps = int(getattr(args_cli, "max_steps", 0) or 0)
+                    if max_steps > 0 and loop_count >= max_steps:
+                        print(f"[sim_main] max_steps={max_steps} reached; stopping controller")
+                        controller.stop()
+                        break
 
                     if _should_exit_after_replay_complete(action_provider, args_cli):
                         print("[sim_main] Replay reached EOF and requested exit; stopping controller")
@@ -1504,6 +1640,12 @@ def main():
     finally:
         # clean up resources
         print("\nclean up resources...")
+        if "eval_video" in locals() and eval_video is not None:
+            saved_video = eval_video.close()
+            if saved_video:
+                print(f"[eval_video] saved {saved_video} frames={len(eval_video.frames)}")
+            else:
+                print(f"[eval_video] no video saved frames={len(eval_video.frames)}")
         _close_image_servers(image_servers)
         controller.cleanup()
         env.close()

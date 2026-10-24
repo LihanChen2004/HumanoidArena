@@ -396,6 +396,13 @@ def main() -> int:
     parser.add_argument("--sonic_encoder_path", type=str, required=True)
     parser.add_argument("--sonic_decoder_path", type=str, required=True)
     parser.add_argument(
+        "--gmt_backend",
+        type=str,
+        default="sonic",
+        choices=["sonic", "sonic_low_latency"],
+        help="SONIC GMT backend variant: sonic (default 1762-dim) or sonic_low_latency (1247-dim).",
+    )
+    parser.add_argument(
         "--sonic_vla_root_rot6d_layout",
         type=str,
         default="auto",

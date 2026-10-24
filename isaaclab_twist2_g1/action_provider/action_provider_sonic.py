@@ -116,6 +116,8 @@ _HEADER_SIZE = 1280
 project_root = os.environ.get("PROJECT_ROOT")
 
 SONIC_VLA_ACTION_DIM = VLA_ROBOT_CURRENT_LOCAL_V3_ACTION_DIM
+SONIC_VLA_LATENT64_ACTION_DIM = 64
+SONIC_VLA_LATENT64_WITH_HAND_ACTION_DIM = 66
 SONIC_VLA_STATE_DIM = VLA_ROBOT_CURRENT_LOCAL_V3_STATE_DIM
 SONIC_HAND_POSE_ROBOT_NAME = "unitree_g1_with_hands"
 
@@ -892,6 +894,27 @@ _STEP5_FRAMES = 10
 _STEP5_STRIDE = 5
 _STEP5_HISTORY_LEN = (_STEP5_FRAMES - 1) * _STEP5_STRIDE + 1
 
+# ---------------------------------------------------------------------------
+# SONIC low-latency teleoperation checkpoint variant.
+# Reference: GR00T-WholeBodyControl gear_sonic_deploy/policy/low_latency/
+#   observation_config.yaml
+# Differences vs default release:
+#   - SMPL future-reference frames: 10 -> 4  (200ms -> 80ms lookahead)
+#   - g1/teleop motion future-reference stride: step5 -> step1 (still 10 frames)
+#   - motion_root_z_position* observations removed
+#   - encoder input dim: 1762 -> 1247 (decoder/policy 994 and token 64 unchanged)
+# Concat order (per low_latency/observation_config.yaml):
+#   encoder_mode(4) | mjp_step1(290) | mjv_step1(290) | mao_step1(60) |
+#   mao_single(6)  | mjpl_step1(120)| mjvl_step1(120)| vr3pt_pos(9)  |
+#   vr3pt_orn(12)  | smpl_joints_4(288) | smpl_anchor_4(24) | wrist_4(24) = 1247
+# ---------------------------------------------------------------------------
+_LL_SMPL_FRAMES = 4                       # SMPL future ref: 4 frames (was 10)
+_LL_MOTION_FRAMES = 10                    # g1/teleop motion: still 10 frames
+_LL_MOTION_STRIDE = 1                     # g1/teleop motion: step1 (was step5)
+_LL_MOTION_HISTORY_LEN = (_LL_MOTION_FRAMES - 1) * _LL_MOTION_STRIDE + 1  # = 10
+_LL_ENCODER_DIM = 1247
+_LL_DECODER_DIM = 994                     # unchanged from default
+
 OFFICIAL_WRIST_INDICES = [23, 24, 25, 26, 27, 28]
 OFFICIAL_LOWERBODY_INDICES = [0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18]
 SMPL_MODE_ACTIVE_BLOCKS = [
@@ -1491,6 +1514,10 @@ class SonicActionProvider(ActionProvider):
         self._sonic_log_every = int(getattr(args_cli, "sonic_log_every", self._sonic_log_every))
         self._enable_rtf_monitor = getattr(args_cli, "enable_rtf_monitor", False)
         self._use_effort_control = bool(getattr(args_cli, "sonic_effort_control", False))
+        self._sonic_input_timeout_s = max(
+            0.0,
+            float(getattr(args_cli, "sonic_input_timeout_s", os.environ.get("SONIC_INPUT_TIMEOUT_S", 0.25))),
+        )
 
         self.enable_dex3    = getattr(args_cli, "enable_dex3_dds",   False)
         self.enable_gripper = getattr(args_cli, "enable_dex1_dds",   False)
@@ -1512,6 +1539,24 @@ class SonicActionProvider(ActionProvider):
         self._gmt_backend = getattr(args_cli, "gmt_backend", "") or ""
         self._use_lerobot_vla = self._input_source == "vla"
         self._sonic_joint29_mode = self._gmt_backend == "sonic_joint29" or self._use_lerobot_vla
+        # SONIC low-latency teleoperation checkpoint variant.
+        # When enabled, the encoder input is assembled per the low_latency
+        # observation_config.yaml (4-frame SMPL, step1 motion, no root_z).
+        self._low_latency = (self._gmt_backend == "sonic_low_latency")
+        self._vla_action_format = str(
+            getattr(args_cli, "sonic_vla_action_format", os.environ.get("SONIC_VLA_ACTION_FORMAT", "semantic_v3"))
+            or "semantic_v3"
+        ).strip().lower()
+        if self._vla_action_format in {"semantic", "semantic40", "semantic_v3", "joint29_v3"}:
+            self._vla_action_format = "semantic_v3"
+        elif self._vla_action_format in {"latent", "latent64", "sonic_latent64", "decoder_latent64"}:
+            self._vla_action_format = "latent64"
+        else:
+            raise ValueError(
+                f"[SonicActionProvider] Unsupported SONIC_VLA_ACTION_FORMAT={self._vla_action_format!r}; "
+                "expected semantic_v3 or latent64"
+            )
+        self._use_vla_latent64 = self._use_lerobot_vla and self._vla_action_format == "latent64"
         self._lerobot_server_url = getattr(args_cli, "lerobot_server_url", "") or ""
         self._lerobot_server_timeout = float(getattr(args_cli, "lerobot_server_timeout", 5.0))
         self._lerobot_server_verify_ssl = bool(getattr(args_cli, "lerobot_server_verify_ssl", False))
@@ -1662,7 +1707,8 @@ class SonicActionProvider(ActionProvider):
         self._latest_recording_control_sequence = -1
         self._raw_pose_payload = {}
         self._latest_pose_payload = {}
-        self._latest_encoder_input = np.zeros((1762,), dtype=np.float32)
+        _enc_dim = _LL_ENCODER_DIM if getattr(self, "_low_latency", False) else 1762
+        self._latest_encoder_input = np.zeros((_enc_dim,), dtype=np.float32)
         self._latest_smpl_joint_window = np.zeros((_STEP1_FRAMES, _N_SMPL_JOINTS, 3), dtype=np.float32)
         self._latest_anchor_window = np.zeros((_STEP1_FRAMES, 6), dtype=np.float32)
         self._latest_wrist_window = np.zeros((_STEP1_FRAMES, len(OFFICIAL_WRIST_INDICES)), dtype=np.float32)
@@ -1679,6 +1725,8 @@ class SonicActionProvider(ActionProvider):
         self._latest_heading_increment = 0.0
         self._latest_consumed_new_this_step = False
         self._latest_consumed_control_step = -1
+        self._last_fresh_input_monotonic = None
+        self._sonic_input_hold_active = False
         self._latest_aligned_body_quat_wxyz = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         self._latest_consumed_anchor_rot6d = np.array([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
         self._latest_canonical_action_raw = _default_vla_action()
@@ -2109,7 +2157,8 @@ class SonicActionProvider(ActionProvider):
         raise ValueError(f"[SonicActionProvider] Unsupported replay_mode: {replay_mode}")
 
     def _resolve_ort_device_id(self) -> int | None:
-        device_name = str(getattr(self, "device", "") or "").strip().lower()
+        # SONIC_ONNX_DEVICE lets us run ONNX encoder/decoder on CPU even when Isaac/Torch stays on cuda:0.
+        device_name = str(os.environ.get("SONIC_ONNX_DEVICE", "") or getattr(self, "device", "") or "").strip().lower()
         if not device_name or device_name == "cpu":
             return None
         if device_name == "cuda":
@@ -2236,10 +2285,16 @@ class SonicActionProvider(ActionProvider):
                 f"[SonicActionProvider] VLA v3.1 policy must use observation.state shape {(SONIC_VLA_STATE_DIM,)}, "
                 f"got {state_shape}"
             )
-        if action_shape and action_shape != (SONIC_VLA_ACTION_DIM,):
+        expected_action_shapes = (
+            {(SONIC_VLA_LATENT64_ACTION_DIM,), (SONIC_VLA_LATENT64_WITH_HAND_ACTION_DIM,)}
+            if self._use_vla_latent64
+            else {(SONIC_VLA_ACTION_DIM,)}
+        )
+        if action_shape and action_shape not in expected_action_shapes:
+            expected = ", ".join(str(shape) for shape in sorted(expected_action_shapes))
             raise ValueError(
-                f"[SonicActionProvider] VLA v3.1 policy must use action shape {(SONIC_VLA_ACTION_DIM,)}, "
-                f"got {action_shape}"
+                f"[SonicActionProvider] VLA policy action shape mismatch for "
+                f"SONIC_VLA_ACTION_FORMAT={self._vla_action_format}: expected {expected}, got {action_shape}"
             )
         policy_cls = get_policy_class(config.type)
 
@@ -2264,7 +2319,8 @@ class SonicActionProvider(ActionProvider):
 
         print(
             f"[SonicActionProvider] LeRobot VLA enabled: "
-            f"path={lerobot_policy_path} type={config.type} device={self._lerobot_device}"
+            f"path={lerobot_policy_path} type={config.type} device={self._lerobot_device} "
+            f"action_format={self._vla_action_format}"
         )
 
     def _get_front_camera_rgb_for_vla(self) -> np.ndarray:
@@ -2356,22 +2412,45 @@ class SonicActionProvider(ActionProvider):
         action_chunk = np.asarray(action_chunk, dtype=np.float32)
         if action_chunk.ndim == 1:
             action_chunk = action_chunk.reshape(1, -1)
-        if action_chunk.ndim != 2 or action_chunk.shape[1] != SONIC_VLA_ACTION_DIM:
+        expected_dims = (
+            {SONIC_VLA_LATENT64_ACTION_DIM, SONIC_VLA_LATENT64_WITH_HAND_ACTION_DIM}
+            if self._use_vla_latent64
+            else {SONIC_VLA_ACTION_DIM}
+        )
+        if action_chunk.ndim != 2 or action_chunk.shape[1] not in expected_dims:
+            expected = "/".join(str(dim) for dim in sorted(expected_dims))
             raise ValueError(
-                f"[SonicActionProvider] Expected canonical VLA action chunk shape [N, {SONIC_VLA_ACTION_DIM}], got {action_chunk.shape}"
+                f"[SonicActionProvider] Expected VLA action chunk shape [N, {expected}] for "
+                f"SONIC_VLA_ACTION_FORMAT={self._vla_action_format}, got {action_chunk.shape}"
             )
         return action_chunk
 
-    def _pop_lerobot_semantic_action(self) -> np.ndarray:
+    def _pop_lerobot_action(self) -> np.ndarray:
         if not self._lerobot_action_chunk_queue:
             for action in self._fetch_lerobot_action_chunk():
                 self._lerobot_action_chunk_queue.append(np.asarray(action, dtype=np.float32).copy())
-        action = np.asarray(self._lerobot_action_chunk_queue.popleft(), dtype=np.float32).reshape(-1)
+        return np.asarray(self._lerobot_action_chunk_queue.popleft(), dtype=np.float32).reshape(-1)
+
+    def _pop_lerobot_semantic_action(self) -> np.ndarray:
+        action = self._pop_lerobot_action()
         if action.shape != (SONIC_VLA_ACTION_DIM,):
             raise ValueError(
                 f"[SonicActionProvider] Expected canonical VLA action dim {SONIC_VLA_ACTION_DIM}, got {action.shape}"
             )
         return action
+
+    def _pop_lerobot_latent64_action(self) -> tuple[np.ndarray, np.ndarray | None]:
+        action = self._pop_lerobot_action()
+        if action.shape == (SONIC_VLA_LATENT64_ACTION_DIM,):
+            return action.astype(np.float32, copy=True), None
+        if action.shape == (SONIC_VLA_LATENT64_WITH_HAND_ACTION_DIM,):
+            latent = action[:SONIC_VLA_LATENT64_ACTION_DIM].astype(np.float32, copy=True)
+            hand_binary = action[SONIC_VLA_LATENT64_ACTION_DIM:].astype(np.float32, copy=True)
+            return latent, hand_binary
+        raise ValueError(
+            f"[SonicActionProvider] Expected latent64 VLA action dim "
+            f"{SONIC_VLA_LATENT64_ACTION_DIM} or {SONIC_VLA_LATENT64_WITH_HAND_ACTION_DIM}, got {action.shape}"
+        )
 
     def _should_refresh_lerobot_visuals_next_step(self) -> bool:
         return (not self._use_lerobot_vla) or (len(self._lerobot_action_chunk_queue) == 0)
@@ -2483,7 +2562,88 @@ class SonicActionProvider(ActionProvider):
         right_closed = bool(runtime_frame.hand_binary[1] >= self._lerobot_hand_binary_threshold)
         self._apply_hand_binary_targets(left_closed=left_closed, right_closed=right_closed)
 
+    def _build_live_decoder_obs_with_latent(self, latent64: np.ndarray) -> np.ndarray:
+        latent = np.asarray(latent64, dtype=np.float32).reshape(1, -1)
+        if latent.shape != (1, SONIC_VLA_LATENT64_ACTION_DIM):
+            raise ValueError(f"[SonicActionProvider] expected latent64 shape (1, 64), got {latent.shape}")
+        robot = self.env.scene["robot"].data
+        joint_pos_sonic = robot.joint_pos[0, self._sonic_idx].cpu().numpy().astype(np.float32)
+        joint_vel_sonic = robot.joint_vel[0, self._sonic_idx].cpu().numpy().astype(np.float32)
+        joint_pos_delta = joint_pos_sonic - self._sonic_default_np
+
+        self._robot_joint_pos_hist = np.roll(self._robot_joint_pos_hist, -1, axis=0)
+        self._robot_joint_pos_hist[-1] = joint_pos_delta
+        self._robot_joint_vel_hist = np.roll(self._robot_joint_vel_hist, -1, axis=0)
+        self._robot_joint_vel_hist[-1] = joint_vel_sonic
+
+        ang_vel = robot.root_ang_vel_b[0].cpu().numpy().astype(np.float32)
+        base_quat_wxyz = robot.root_state_w[0, 3:7].cpu().numpy().astype(np.float32)
+        proj_grav = gravity_dir_from_base_quat_wxyz(base_quat_wxyz)
+
+        self._ang_vel_hist = np.roll(self._ang_vel_hist, -1, axis=0)
+        self._ang_vel_hist[-1] = ang_vel
+        self._grav_dir_hist = np.roll(self._grav_dir_hist, -1, axis=0)
+        self._grav_dir_hist[-1] = proj_grav
+
+        dec_obs = np.concatenate([
+            latent.reshape(-1),
+            self._ang_vel_hist.flatten(),
+            self._robot_joint_pos_hist.flatten(),
+            self._robot_joint_vel_hist.flatten(),
+            self._last_action_hist.flatten(),
+            self._grav_dir_hist.flatten(),
+        ])[np.newaxis].astype(np.float32)
+        self._latent = latent
+        self._latest_decoder_obs = dec_obs[0].astype(np.float32, copy=True)
+        return dec_obs
+
+    def _decode_sonic_latent64_live(self, latent64: np.ndarray) -> np.ndarray:
+        if self._decoder is None:
+            raise RuntimeError("[SonicActionProvider] Decoder missing during live latent64 VLA inference")
+        dec_obs = self._build_live_decoder_obs_with_latent(latent64)
+        t_dec0 = time.perf_counter()
+        action_sonic = self._decoder.run(None, {self._decoder.get_inputs()[0].name: dec_obs})[0]
+        t_dec1 = time.perf_counter()
+        raw_sonic_unclipped = action_sonic.flatten()[:29].astype(np.float32, copy=False)
+        self._latest_decoder_raw_action = raw_sonic_unclipped.astype(np.float32, copy=True)
+        self._last_action_hist = np.roll(self._last_action_hist, -1, axis=0)
+        self._last_action_hist[-1] = raw_sonic_unclipped
+        target_sonic = raw_sonic_unclipped * G1_ACTION_SCALE_ISAACLAB + self._sonic_default_np
+        self._latest_decoder_target = target_sonic.astype(np.float32, copy=True)
+
+        dec_ms = (t_dec1 - t_dec0) * 1000.0
+        self._perf_encoder_ms.append(0.0)
+        self._perf_decoder_ms.append(dec_ms)
+        if len(self._perf_encoder_ms) > self._perf_buffer_size:
+            self._perf_encoder_ms.pop(0)
+        if len(self._perf_decoder_ms) > self._perf_buffer_size:
+            self._perf_decoder_ms.pop(0)
+        if self._sonic_debug and (self._frame_count <= 3 or self._frame_count % self._sonic_log_every == 0):
+            print(
+                "[SONIC][VLA_LATENT64] "
+                f"decoder_ms={dec_ms:.2f} "
+                f"latent_range=[{float(np.min(latent64)):0.4f},{float(np.max(latent64)):0.4f}] "
+                f"raw_range=[{float(np.min(raw_sonic_unclipped)):0.4f},{float(np.max(raw_sonic_unclipped)):0.4f}]"
+            )
+        return target_sonic.astype(np.float32)
+
+    def _run_gear_sonic_latent64_from_vla(self) -> np.ndarray:
+        latent64, hand_binary = self._pop_lerobot_latent64_action()
+        self._latest_vla_action = (
+            np.concatenate([latent64, hand_binary]).astype(np.float32)
+            if hand_binary is not None
+            else latent64.astype(np.float32, copy=True)
+        )
+        if hand_binary is not None:
+            self._apply_hand_binary_targets(
+                left_closed=bool(hand_binary[0] >= self._lerobot_hand_binary_threshold),
+                right_closed=bool(hand_binary[1] >= self._lerobot_hand_binary_threshold),
+            )
+        return self._decode_sonic_latent64_live(latent64)
+
     def _run_gear_sonic_from_vla(self) -> np.ndarray:
+        if self._use_vla_latent64:
+            return self._run_gear_sonic_latent64_from_vla()
         action = self._infer_lerobot_semantic_action()
         self._apply_lerobot_semantic_action(action)
         return self._run_gear_sonic()
@@ -3764,6 +3924,11 @@ class SonicActionProvider(ActionProvider):
 
     def _get_stream_required_future_span(self) -> int:
         """Return the global-frame future span required by the active encoder mode."""
+        if getattr(self, "_low_latency", False):
+            # Low-latency: g1/teleop use 10-frame step1; SMPL uses 4-frame step1.
+            if self._sonic_joint29_mode:
+                return (_LL_MOTION_FRAMES - 1) * _LL_MOTION_STRIDE * self._stream_frame_step
+            return (_LL_SMPL_FRAMES - 1) * self._stream_frame_step
         if self._sonic_joint29_mode:
             return (_STEP5_FRAMES - 1) * _STEP5_STRIDE * self._stream_frame_step
         return (_STEP1_FRAMES - 1) * self._stream_frame_step
@@ -4280,6 +4445,8 @@ class SonicActionProvider(ActionProvider):
             self._latest_timestamp_monotonic = float(self._raw_input_timestamp_monotonic)
             self._latest_consumed_new_this_step = True
             self._latest_consumed_control_step = int(self._frame_count)
+            self._last_fresh_input_monotonic = time.monotonic()
+            self._sonic_input_hold_active = False
             self._latest_controller_data = self._raw_controller_data
             self._consumed_controller_data = self._raw_controller_data
 
@@ -4835,6 +5002,30 @@ class SonicActionProvider(ActionProvider):
                 "refusing to fall back to default pose"
             )
         if (
+            not self._replay_enabled
+            and not self._use_lerobot_vla
+            and self._sonic_input_timeout_s > 0.0
+            and (
+                self._last_fresh_input_monotonic is None
+                or time.monotonic() - self._last_fresh_input_monotonic > self._sonic_input_timeout_s
+            )
+        ):
+            if not self._sonic_input_hold_active:
+                age = float("inf") if self._last_fresh_input_monotonic is None else (
+                    time.monotonic() - self._last_fresh_input_monotonic
+                )
+                print(
+                    "[SONIC] no fresh pose input for "
+                    f"{age:.3f}s (timeout={self._sonic_input_timeout_s:.3f}s); holding default pose"
+                )
+            self._sonic_input_hold_active = True
+            self._last_action_hist.fill(0.0)
+            self._latest_decoder_raw_action.fill(0.0)
+            self._latest_decoder_target = self._sonic_default_np.copy()
+            self._left_hand_target.fill(0.0)
+            self._right_hand_target.fill(0.0)
+            return self._sonic_default_np.copy()
+        if (
             self._sonic_joint29_mode
             and not self._latest_consumed_new_this_step
             and not self._anchor_heading_initialized
@@ -4974,29 +5165,61 @@ class SonicActionProvider(ActionProvider):
                 reference_joint_window = None
 
             # 拼接所有观察值
-            encoder_input = np.concatenate([
-                encoder_mode,                           # 4
-                motion_joint_pos_step5_full,            # 290
-                motion_joint_vel_step5_full,            # 290
-                motion_root_z_step5,                    # 10
-                motion_root_z,                          # 1
-                motion_anchor_orient,                   # 6
-                motion_anchor_orient_step5_full,        # 60
-                motion_joint_pos_lowerbody_full,        # 120
-                motion_joint_vel_lowerbody_full,        # 120
-                vr_3pt_pos,                             # 9
-                vr_3pt_orn,                             # 12
-                smpl_joints_flat,                       # 720
-                smpl_anchor_orient_flat,                # 60
-                motion_wrist_pos,                       # 60
-            ])[np.newaxis]  # (1, 1762)
+            if getattr(self, "_low_latency", False):
+                # SONIC low-latency teleoperation checkpoint (encoder input = 1247).
+                # Per low_latency/observation_config.yaml:
+                #   - SMPL future-ref windows truncated to 4 frames (80ms lookahead)
+                #   - g1/teleop motion blocks use step1 (10 frames, stride 1)
+                #   - motion_root_z_position* blocks removed
+                #   - motion_anchor_orientation order: multi-frame(60) then single(6)
+                ll_smpl_frames = _LL_SMPL_FRAMES
+                # Truncate SMPL windows from 10 frames down to 4 (take the latest 4).
+                smpl_joint_window_ll = smpl_joint_window[-ll_smpl_frames:]
+                anchor_window_ll = anchor_window[-ll_smpl_frames:]
+                wrist_window_ll = wrist_window[-ll_smpl_frames:]
+                smpl_joints_flat = smpl_joint_window_ll.reshape(-1)            # 288
+                smpl_anchor_orient_flat = anchor_window_ll.reshape(-1)        # 24
+                motion_wrist_pos = wrist_window_ll.reshape(-1)                # 24
+
+                encoder_input = np.concatenate([
+                    encoder_mode,                           # 4
+                    motion_joint_pos_step5_full,            # 290  (g1, step1)
+                    motion_joint_vel_step5_full,            # 290  (g1, step1)
+                    motion_anchor_orient_step5_full,        # 60   (multi-frame, FIRST)
+                    motion_anchor_orient,                   # 6    (single-frame, SECOND)
+                    motion_joint_pos_lowerbody_full,        # 120  (teleop, step1)
+                    motion_joint_vel_lowerbody_full,        # 120  (teleop, step1)
+                    vr_3pt_pos,                             # 9
+                    vr_3pt_orn,                             # 12
+                    smpl_joints_flat,                       # 288  (SMPL, 4-frame)
+                    smpl_anchor_orient_flat,                # 24   (SMPL, 4-frame)
+                    motion_wrist_pos,                       # 24   (SMPL, 4-frame)
+                ])[np.newaxis]  # (1, 1247)
+            else:
+                encoder_input = np.concatenate([
+                    encoder_mode,                           # 4
+                    motion_joint_pos_step5_full,            # 290
+                    motion_joint_vel_step5_full,            # 290
+                    motion_root_z_step5,                    # 10
+                    motion_root_z,                          # 1
+                    motion_anchor_orient,                   # 6
+                    motion_anchor_orient_step5_full,        # 60
+                    motion_joint_pos_lowerbody_full,        # 120
+                    motion_joint_vel_lowerbody_full,        # 120
+                    vr_3pt_pos,                             # 9
+                    vr_3pt_orn,                             # 12
+                    smpl_joints_flat,                       # 720
+                    smpl_anchor_orient_flat,                # 60
+                    motion_wrist_pos,                       # 60
+                ])[np.newaxis]  # (1, 1762)
             self._latest_encoder_input = encoder_input[0].astype(np.float32, copy=True)
             self._latest_smpl_joint_window = smpl_joint_window.astype(np.float32, copy=True)
             self._latest_anchor_window = anchor_window.astype(np.float32, copy=True)
             self._latest_wrist_window = wrist_window.astype(np.float32, copy=True)
 
             if do_log:
-                print(f"[SONIC] Encoder input shape: {encoder_input.shape}, expected: (1, 1762)")
+                _ll_exp = 1247 if getattr(self, "_low_latency", False) else 1762
+                print(f"[SONIC] Encoder input shape: {encoder_input.shape}, expected: (1, {_ll_exp})")
                 print(f"[SONIC] Encoder input dtype: {encoder_input.dtype}")
                 print(f"[SONIC] Encoder input range: [{encoder_input.min():.4f}, {encoder_input.max():.4f}]")
                 if self._sonic_joint29_mode:

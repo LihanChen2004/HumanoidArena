@@ -1,139 +1,233 @@
-<div align="center">
-  <h1>HumanoidArena 遥操作与 Replay 指南</h1>
-  <p>TWIST2 / SONIC / Isaac Lab G1 全身遥操作、录制与 replay</p>
-  <p><i>Taowen Wang</i></p>
-</div>
+# HumanoidArena
 
----
+HumanoidArena is a humanoid manipulation and whole-body control benchmark built around teleoperation, replay, simulation evaluation, and LeRobot-compatible policy training. The repository provides TWIST2, SONIC, and MimicLite control pipelines, Isaac Lab environments, data conversion utilities, and evaluation scripts used by the project.
 
-## 目录
+<p align="center">
+  <a href="https://humanoidarena.github.io/">Project Page</a> |
+  <a href="https://arxiv.org/abs/2606.17833">arXiv</a> |
+  <a href="https://www.modelscope.cn/datasets/Twang2026/HumanoidArenaV3.1">HF Dataset</a> |
+  <a href="https://www.modelscope.cn/models/Twang2026/HumanoidArena_models">HF Models</a> |
+  <a href="https://drive.google.com/file/d/1TCa_aVRmFrZs_l4wlxkqanNebvDtChNk/view?usp=sharing">Assets</a>
+</p>
 
-- [概述](#概述)
-- [安装](#安装)
-- [使用流程](#使用流程)
-  - [Step 1：打开 XRobotToolkit](#step-1打开-xrobottoolkit)
-  - [Step 2：运行 teleop 或 Pico server](#step-2运行-teleop-或-pico-server)
-  - [Step 3：运行 Isaac Lab](#step-3运行-isaac-lab)
-  - [Step 4：运行 replay](#step-4运行-replay)
+<p align="center">
+  <img src="img/paper-main-figure.svg" alt="HumanoidArena system overview" width="90%">
+</p>
 
----
+## Overview
 
-## 概述
+HumanoidArena focuses on full-body humanoid interaction tasks with reproducible data collection and policy evaluation. The current release includes:
 
-本文档介绍当前仓库里两条主要链路：
+- TWIST2, SONIC, and MimicLite teleoperation entrypoints.
+- Isaac Lab environments for live control, replay, rerecording, and VLA evaluation.
+- NPZ recording and multicam rerecording pipelines.
+- LeRobot-compatible data and model release links.
+- Batch evaluation scripts for vision execution and semantic tests.
 
-- `TWIST2 + IsaacLab`
-- `SONIC + IsaacLab`
+Supported workflows currently differ by backend:
 
-| 步骤 | 组件                    | 作用                          |
-| ---- | ----------------------- | ----------------------------- |
-| 1    | XRobotToolkit（Linux）  | 接收头显姿态数据并串流        |
-| 2    | TWIST2 / SONIC 上游输入 | 姿态解算，通过 Redis 发布动作 |
-| 3    | IsaacLab `run_*.sh`     | 仿真接收动作并驱动机器人      |
-| 4    | IsaacLab `run_replay_*.sh` | 从录制 `.npz` 做 replay   |
+| Backend | Teleoperation / data collection | VLA evaluation | Notes |
+| --- | --- | --- | --- |
+| TWIST2 | Supported | Supported | Maintained baseline backend. |
+| SONIC | Supported | Supported | Use the canonical 29-joint publishing route for current V3.1 data collection. |
+| MimicLite | Supported | Supported | Supports live teleoperation recording and in-GMT/cross-GMT evaluation. |
+| SONIC low-latency | Not yet released as a supported collection workflow | Supported | Evaluation-only support for the low-latency SONIC encoder/decoder variant. |
 
----
+## Release Plan
 
-## 安装
+- [x] LeRobot data released
+- [x] Models released
+- [x] Raw data release
+- [ ] Multicam data release
 
-新机器部署建议先阅读项目级环境说明：
+## Quick Links
 
-- [环境部署说明](./isaaclab_twist2_g1/docs/ENVIRONMENT_SETUP.md)
+| Resource | Link |
+| --- | --- |
+| Project page | https://humanoidarena.github.io/ |
+| Paper | https://arxiv.org/abs/2606.17833 |
+| LeRobot dataset | https://www.modelscope.cn/datasets/Twang2026/HumanoidArenaV3.1 |
+| Raw data | https://www.modelscope.cn/datasets/Twang2026/HumanoidArena_raw |
+| Model checkpoints | https://www.modelscope.cn/models/Twang2026/HumanoidArena_models |
+| Simulation assets | https://drive.google.com/file/d/1TCa_aVRmFrZs_l4wlxkqanNebvDtChNk/view?usp=sharing |
 
-运行前请先完成以下组件的安装：
+## Documentation
 
-| 组件      | 安装文档 |
-| --------- | -------- |
-| Conda / Isaac Sim / Isaac Lab / LeRobot 环境 | [环境部署说明](./isaaclab_twist2_g1/docs/ENVIRONMENT_SETUP.md) |
-| IsaacLab 仿真桥接 | [isaaclab_twist2_g1/README.md](./isaaclab_twist2_g1/README.md) |
-| TWIST2    | [TWIST2/README.md](./TWIST2/README.md) |
+Start with the release-facing guides:
 
----
+- [Environment setup](docs/04_environment_setup.md)
+- [Teleoperation and recording](docs/01_teleoperation.md)
+- [Data pipeline](docs/02_data_pipeline.md)
+- [Evaluation](docs/03_evaluation.md)
 
-## 使用流程
+Additional implementation references:
 
-常用命令已经单独整理到：
+- [TWIST2 raw NPZ format](isaaclab_twist2_g1/docs/TWIST2_DATA_FORMAT.md)
+- [SONIC raw NPZ format](isaaclab_twist2_g1/docs/SONIC_DATA_FORMAT.md)
+- [LeRobot V3.1 format](isaaclab_twist2_g1/docs/UNITREE_G1_GMT_REFPOSE_V3_1_DATA_PROTOCOL.md)
+- [Scene randomization seed rules](isaaclab_twist2_g1/docs/SCENE_RANDOMIZATION_SEED_RULES.md)
 
-- [isaaclab_twist2_g1/docs/COMMAND_QUICKSTART.md](./isaaclab_twist2_g1/docs/COMMAND_QUICKSTART.md)
+## Repository Layout
 
-### Step 1：打开 XRobotToolkit
-
-在 **Linux 机器**上启动 XRobotToolkit，用于接收 PICO 头显的姿态数据。
-
-![XRobotToolkit](xrobotoolkit.png)
-
-> 确认头显已连接并在界面中显示正常后，进入下一步。
-
----
-
-### Step 2：运行 teleop 或 Pico server
-
-如果走 `TWIST2`，进入 `TWIST2` 目录，启动遥操作脚本：
-
-```bash
-cd TWIST2
-bash teleop.sh
+```text
+TWIST2/                 TWIST2 control, assets, checkpoints, and robot-side utilities
+isaaclab_twist2_g1/     Isaac Lab tasks, replay, rerecording, and evaluation entrypoints
+lerobot/                LeRobot fork/integration for training and policy serving
+docs/                   Release-facing documentation and evaluation examples
 ```
 
-脚本会自动激活 `gmr` conda 环境，并运行 `xrobot_teleop_to_robot_w_hand.py`。
+## Getting Started
 
-如果走 `SONIC`，通常需要先启动 `isaaclab_twist2_g1/pico_server/` 下对应的 Pico server。
-
-#### 调整人体高度
-
-在运行前，根据实际情况修改 `teleop.sh` 中的身高参数：
+Set up the simulation and LeRobot environments first:
 
 ```bash
-actual_human_height=1.79   # 单位：米，根据实际身高调整
+bash isaaclab_twist2_g1/tools/setup_humanoidarena_envs.sh --dry-run
 ```
 
-> **注意**：由于 PICO 对高度估计存在误差，建议将该值设置为**略小于**实际身高。
+After reviewing the generated commands, follow [Environment setup](docs/04_environment_setup.md) for the full installation path.
 
-启动后终端会以 1Hz 打印帧率，确认数据正常流动后进入下一步。
+HumanoidArena supports PICO/XRobotToolkit whole-body and hand tracking for TWIST2, SONIC, and MimicLite teleoperation. SONIC low-latency is currently evaluation-only. See [Teleoperation and recording](docs/01_teleoperation.md) for tracker preparation, server/runtime pairings, task configuration, and recording commands. Do not use the legacy `cd TWIST2 && bash teleop.sh` path.
 
----
-
-### Step 3：运行 Isaac Lab
-
-常用 live / 录制命令见：
-
-- [isaaclab_twist2_g1/docs/COMMAND_QUICKSTART.md#1-遥操作录制](./isaaclab_twist2_g1/docs/COMMAND_QUICKSTART.md#1-遥操作录制)
-
-在 `isaaclab_twist2_g1` 根目录下启动仿真：
-
-```bash
-bash run_twist2.sh
-# 或
-bash run_sonic.sh
-```
-
-脚本顶部参数区可直接修改：
-
-- 任务名
-- 机器人 USD / 碰撞模式
-- 录制目录
-- 图传地址
-- replay 文件路径
-
-更完整的入口说明见：
-
-- [isaaclab_twist2_g1/README.md](./isaaclab_twist2_g1/README.md)
-
-### Step 4：运行 replay
-
-常用 replay / rerecord / LeRobot 评测命令见：
-
-- [isaaclab_twist2_g1/docs/COMMAND_QUICKSTART.md#2-replay](./isaaclab_twist2_g1/docs/COMMAND_QUICKSTART.md#2-replay)
-- [isaaclab_twist2_g1/docs/COMMAND_QUICKSTART.md#3-rerecord](./isaaclab_twist2_g1/docs/COMMAND_QUICKSTART.md#3-rerecord)
-- [isaaclab_twist2_g1/docs/COMMAND_QUICKSTART.md#4-lerobot--vla-评测](./isaaclab_twist2_g1/docs/COMMAND_QUICKSTART.md#4-lerobot--vla-评测)
+For replay:
 
 ```bash
 bash isaaclab_twist2_g1/run_replay_twist2.sh
-# 或
 bash isaaclab_twist2_g1/run_replay_sonic.sh
 ```
 
-对应数据格式说明：
+## Data and Models
 
-- [TWIST2_DATA_FORMAT.md](./isaaclab_twist2_g1/docs/TWIST2_DATA_FORMAT.md)
-- [SONIC_DATA_FORMAT.md](./isaaclab_twist2_g1/docs/SONIC_DATA_FORMAT.md)
+The git repository should contain source code, small examples, and required lightweight runtime assets. Large data and model artifacts are released separately:
+
+| Artifact | Status | Location |
+| --- | --- | --- |
+| LeRobot dataset | Released | https://www.modelscope.cn/datasets/Twang2026/HumanoidArenaV3.1 |
+| Model checkpoints | Released | https://www.modelscope.cn/models/Twang2026/HumanoidArena_models |
+| Simulation assets | Released | https://drive.google.com/file/d/1TCa_aVRmFrZs_l4wlxkqanNebvDtChNk/view?usp=sharing |
+| Raw data | Released | https://www.modelscope.cn/datasets/Twang2026/HumanoidArena_raw |
+| Multicam data | Planned | To be announced |
+
+Download released model checkpoints from the Hugging Face model repository into any local artifact directory and keep the published folder layout:
+
+```bash
+huggingface-cli download HumanoidArena/<model-repo> \
+  --local-dir /path/to/humanoidarena_checkpoints
+```
+
+Batch evaluation scripts read that directory through `MODEL_ROOT_BASE`:
+
+```text
+/path/to/humanoidarena_checkpoints/
+  small/
+  small_merge/
+  pi/
+```
+
+Download the simulation asset package separately from the release asset link and restore it under the Isaac Lab package:
+
+```text
+isaaclab_twist2_g1/assets/
+  objects/
+  robots/
+```
+
+The asset package is intentionally distributed outside git and released through the simulation assets link above.
+
+The TWIST2 ONNX checkpoints required by the current runtime are kept in git:
+
+```text
+TWIST2/assets/ckpts/twist2_1017_20k.onnx
+TWIST2/assets/ckpts/twist2_1017_25k.onnx
+```
+
+## Evaluation
+
+Single-checkpoint VLA evaluation:
+
+```bash
+MODEL_PATH=/path/to/checkpoint/pretrained_model \
+EVAL_SEEDS="0 1 2" \
+bash isaaclab_twist2_g1/script/eval_scripts/sonic/run_vla_eval.sh
+
+MODEL_PATH=/path/to/checkpoint/pretrained_model \
+EVAL_SEEDS="0 1 2" \
+bash isaaclab_twist2_g1/script/eval_scripts/twist2/run_vla_eval.sh
+
+MODEL_PATH=/path/to/checkpoint/pretrained_model \
+EVAL_SEEDS="0 1 2" \
+bash isaaclab_twist2_g1/script/eval_scripts/mimic_lite/run_vla_eval.sh
+
+MODEL_PATH=/path/to/checkpoint/pretrained_model \
+EVAL_SEEDS="0 1 2" \
+bash isaaclab_twist2_g1/script/eval_scripts/sonic_low_latency/run_vla_eval.sh
+```
+
+`MODEL_PATH` may also point to a checkpoint directory that contains `pretrained_model/`. For PI0.5 checkpoints, use the matching scripts under `script/eval_scripts/sonic_pi05/` or `script/eval_scripts/twist2_pi05/`. SONIC low-latency is currently supported for evaluation only; it is not a released data-collection backend.
+
+Batch evaluation entrypoints include:
+
+```text
+isaaclab_twist2_g1/batch_test_scripts/batch_1_test_v31_sonic.sh
+isaaclab_twist2_g1/batch_test_scripts/batch_1_test_v31_twist2.sh
+isaaclab_twist2_g1/batch_test_scripts/batch_1_test_v31_merage.sh
+isaaclab_twist2_g1/batch_test_scripts/batch_pi05_v31_sonic.sh
+isaaclab_twist2_g1/batch_test_scripts/batch_pi05_v31_twist2.sh
+isaaclab_twist2_g1/batch_test_scripts/batch_eval_mimic_lite_v3_1.sh
+isaaclab_twist2_g1/batch_test_scripts/batch_eval_0529_v3_1.sh
+```
+
+See [Evaluation](docs/03_evaluation.md) for vision execution, semantic evaluation, and batch launch examples.
+
+### SONIC latent VLA inference
+
+The SONIC VLA runtime also supports policies that output SONIC encoder latents instead of the default 40-D semantic VLA command. This is intended for users who train a VLA directly on `encoder_latent` from SONIC raw recordings.
+
+This interface is experimental and intended for testing latent-output VLA policies. It has not yet been validated for exact replay equivalence with direct replay.
+
+Set `SONIC_VLA_ACTION_FORMAT=latent64` when launching a live VLA evaluation with `--gmt_backend sonic` and `--input_source vla`. The policy may return either a 64-D latent action, or a 66-D action where the final two values are left/right hand binary commands. For HTTP inference servers, accepted response keys are `latent64`, `latent64_chunk`, `encoder_latent`, or `encoder_latent_chunk`.
+
+```bash
+SONIC_VLA_ACTION_FORMAT=latent64 \
+python isaaclab_twist2_g1/sim_main.py \
+  --input_source vla \
+  --gmt_backend sonic \
+  --lerobot_server_url http://127.0.0.1:18080 \
+  --sonic_decoder_path /path/to/sonic_decoder.onnx \
+  --task Isaac-Move-Open-Door-G129-Dex3-Wholebody \
+  --robot_type g129
+```
+
+This is a live inference interface for latent-output VLA policies. Replay remains limited to the maintained replay modes documented in [Data Pipeline](docs/02_data_pipeline.md).
+
+## Citation
+
+If you use HumanoidArena in your research, please cite:
+
+```bibtex
+@article{wang2026humanoidarena,
+  title={HumanoidArena: Benchmarking Egocentric Hierarchical Whole-body Learning},
+  author={Wang, Taowen and Xie, Zikang and Yang, Bin and others},
+  journal={arXiv preprint arXiv:2606.17833},
+  year={2026}
+}
+```
+
+## Contact
+
+To join the community group, add either WeChat account: **xiezhikang2003** or **Chanw15**.
+
+## Acknowledgements
+
+HumanoidArena builds on and interoperates with the following open-source projects and datasets:
+
+| Project | Role in HumanoidArena | Upstream | License / terms |
+| --- | --- | --- | --- |
+| TWIST2 | Whole-body teleoperation and motion/control pipeline | https://github.com/YanjieZe/TWIST | MIT |
+| SONIC / GR00T Whole-Body Control | SONIC controller, policy artifacts, and deployment workflow | https://github.com/NVlabs/GR00T-WholeBodyControl | Source: Apache-2.0; model weights: NVIDIA Open Model License |
+| LeRobot | Dataset format, training, and VLA policy serving integration | https://github.com/huggingface/lerobot | Apache-2.0 |
+| Unitree Sim IsaacLab | Isaac Lab simulator foundation and Unitree task patterns | https://github.com/unitreerobotics/unitree_sim_isaaclab | Apache-2.0 |
+| ArtVIP | Articulated-object assets and digital-twin dataset reference | https://huggingface.co/datasets/X-Humanoid/ArtVIP | Apache-2.0 |
+
+## License
+
+HumanoidArena includes code derived from or integrated with the projects above. Please review this repository's license files, upstream project licenses, and model/data artifact terms before redistribution or commercial use. Third-party simulator dependencies, robot assets, datasets, and model weights may be governed by separate terms.
